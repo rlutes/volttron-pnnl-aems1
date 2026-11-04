@@ -587,7 +587,9 @@ class ManagerProxy:
             earliest_start_time: int
             allowable_setpoint_deviation: float
             optimal_start_lockout_temperature: float = 30
-            training_period_window: int = 10
+            training_period_window: int = 8
+            models: list[str] = ['recovery_regression']   # one model, or several (median); names:
+                                                          # recovery_regression, carrier, johnson, siemens, sbs
         :type config: OptimalStartConfig | dict
         :param update_store: True when method is triggered via RPC (store data in config store).
         :type update_store: bool
@@ -604,6 +606,7 @@ class ManagerProxy:
             if config.earliest_start_time else self.cfg.optimal_start.earliest_start_time
         self.cfg.optimal_start.latest_start_time = config.latest_start_time \
             if config.latest_start_time else self.cfg.optimal_start.latest_start_time
+        self.cfg.optimal_start.models = list(config.models)
         if update_store:
             self.config_set('optimal_start', config)
 
@@ -859,7 +862,7 @@ class ManagerProxy:
             _log.debug(f'Unit is between earliest start time and occupancy start!')
             _log.debug(f'Set unit to unoccupied mode and restart optimal start')
             self.change_occupancy(OccupancyTypes.UNOCCUPIED)
-            self.optimal_start.run_schedule_greenlet = None
+            self.optimal_start.reset_run()
 
         # # if we are in a time when we can do optimal start, schedule pre-start calculations
         if self.optimal_start.run_schedule_greenlet is None:
