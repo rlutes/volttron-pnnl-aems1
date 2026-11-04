@@ -1201,6 +1201,27 @@ class Sbs(OptimalStartZoneModel):
         return result if result.ndim else float(result)
 
 
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """
+    Weighted quantile (linear interpolation between weighted midpoints).
+
+    With equal weights this matches ``np.quantile(values, q, method="hazen")``.
+
+    :param values: Values.
+    :type values: np.ndarray
+    :param weights: Non-negative weight per value.
+    :type weights: np.ndarray
+    :param q: Quantile in [0, 1].
+    :type q: float
+    :return: The weighted ``q`` quantile.
+    :rtype: float
+    """
+    order = np.argsort(values)
+    v, w = np.asarray(values, dtype=float)[order], np.asarray(weights, dtype=float)[order]
+    cumulative = (np.cumsum(w) - 0.5 * w) / w.sum()
+    return float(np.interp(q, cumulative, v))
+
+
 class RecoveryRegression(OptimalStartZoneModel):
     """
     Learns the start time directly from observed recoveries.
@@ -1208,7 +1229,8 @@ class RecoveryRegression(OptimalStartZoneModel):
     Each morning gives one observation for the mode the zone needed: the gap to
     setpoint and the outdoor-air difference at unit start, and the minutes the
     zone took to get within ``TARGET_DEVIATION`` of setpoint. The prediction is a
-    robust (Huber) least-squares fit over the last ``HISTORY`` observations::
+    robust (Huber) least-squares fit over the last ``HISTORY`` observations,
+    weighted toward recent mornings (see ``HALF_LIFE``)::
 
         minutes = a + b * gap + c * gap * oat_diff + margin
 
@@ -1216,9 +1238,13 @@ class RecoveryRegression(OptimalStartZoneModel):
     * ``b`` - minutes per °F of gap in mild weather;
     * ``c`` - how outdoor air changes the cost of each degree;
     * ``oat_diff`` - OAT - SP for cooling, SP - OAT for heating (larger = harder);
-    * ``margin`` - the ``MARGIN_QUANTILE`` quantile of the fit residuals: a
-      learned bias toward starting slightly early, since a late start costs
-      comfort.
+    * ``margin`` - the ``MARGIN_QUANTILE`` quantile of the fit residuals
+      (recency weighted): a learned bias toward starting slightly early, since
+      a late start costs comfort.
+
+    Each observation's weight halves every ``HALF_LIFE`` observations back, so
+    the fit follows seasonal changes (it matters most for heating, whose
+    recoveries shift over a winter) while older mornings still steady it.
 
     Without a usable outdoor-air reading (missing or stale), or with fewer than
     ``MIN_OBSERVATIONS`` observations that have one, the fit drops the outdoor
@@ -1234,6 +1260,8 @@ class RecoveryRegression(OptimalStartZoneModel):
     :cvar HISTORY: Observations kept per mode.
     :cvar MIN_OBSERVATIONS: Observations needed before the model is trained.
     :cvar MARGIN_QUANTILE: Residual quantile added as the early-start margin.
+    :cvar HALF_LIFE: Observations back at which an observation's weight halves
+        (recency weighting of the fit and margin); 0 weights all equally.
     :cvar OBSERVATION_HORIZON_MINUTES: Minutes after occupancy a recovery is
         observed.
     :ivar observations_cooling: Cooling observations,
@@ -1252,6 +1280,7 @@ class RecoveryRegression(OptimalStartZoneModel):
     HISTORY = 20
     MIN_OBSERVATIONS = 5
     MARGIN_QUANTILE = 0.7
+    HALF_LIFE = 3
     OBSERVATION_HORIZON_MINUTES = 90
     _HUBER_K = 1.345
 
@@ -1425,42 +1454,52 @@ class RecoveryRegression(OptimalStartZoneModel):
         :rtype: float
         """
         obs = np.array([[o[1], np.nan if o[2] is None else o[2], o[3]] for o in history], dtype=float)
+        age = np.arange(len(obs))[::-1].astype(float)          # 0 = newest observation
         with_oat = np.isfinite(oat_diff) and np.isfinite(obs[:, 1]).sum() >= self.MIN_OBSERVATIONS
         if with_oat:
-            obs = obs[np.isfinite(obs[:, 1])]
+            keep = np.isfinite(obs[:, 1])
+            obs, age = obs[keep], age[keep]
             design = np.column_stack([np.ones(len(obs)), obs[:, 0], obs[:, 0] * obs[:, 1]])
             x = np.array([1.0, gap, gap * oat_diff])
         else:
             design = np.column_stack([np.ones(len(obs)), obs[:, 0]])
             x = np.array([1.0, gap])
-        coef, residuals = self._huber_fit(design, obs[:, 2])
-        return float(x @ coef + np.quantile(residuals, self.MARGIN_QUANTILE))
+        if not self.HALF_LIFE:                                  # equal weights (unweighted fit)
+            coef, residuals = self._huber_fit(design, obs[:, 2])
+            return float(x @ coef + np.quantile(residuals, self.MARGIN_QUANTILE))
+        recency = 0.5 ** (age / self.HALF_LIFE)
+        coef, residuals = self._huber_fit(design, obs[:, 2], recency)
+        return float(x @ coef + _weighted_quantile(residuals, recency, self.MARGIN_QUANTILE))
 
     @classmethod
-    def _huber_fit(cls, design: np.ndarray, y: np.ndarray, iterations: int = 5):
+    def _huber_fit(cls, design: np.ndarray, y: np.ndarray, base_weights: Optional[np.ndarray] = None,
+                   iterations: int = 5):
         """
         Robust least squares (iteratively reweighted, Huber weights).
 
         Each pass fits weighted least squares, estimates the typical residual from
         the median absolute deviation, and down-weights observations whose residual
         exceeds ``_HUBER_K`` times that scale, so one unusual morning cannot pull the
-        fit far.
+        fit far. The Huber weights multiply ``base_weights`` (the recency weights).
 
         :param design: Design matrix (one row per observation).
         :type design: np.ndarray
         :param y: Observed minutes.
         :type y: np.ndarray
+        :param base_weights: Per-observation weights (default: all 1).
+        :type base_weights: np.ndarray | None
         :param iterations: Reweighting passes.
         :type iterations: int
         :return: ``(coefficients, residuals)`` of the final pass.
         :rtype: tuple[np.ndarray, np.ndarray]
         """
-        weights = np.ones(len(y))
+        base = np.ones(len(y)) if base_weights is None else np.asarray(base_weights, dtype=float)
+        weights = base.copy()
         for _ in range(iterations):
             sw = np.sqrt(weights)
             coef, *_ = np.linalg.lstsq(design * sw[:, None], y * sw, rcond=None)
             residuals = y - design @ coef
             scale = 1.4826 * np.median(np.abs(residuals - np.median(residuals))) or 1.0
             k = cls._HUBER_K * scale
-            weights = np.where(np.abs(residuals) <= k, 1.0, k / np.maximum(np.abs(residuals), 1e-9))
+            weights = base * np.where(np.abs(residuals) <= k, 1.0, k / np.maximum(np.abs(residuals), 1e-9))
         return coef, residuals

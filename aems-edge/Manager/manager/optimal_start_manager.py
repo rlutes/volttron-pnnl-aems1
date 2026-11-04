@@ -260,6 +260,8 @@ class OptimalStartManager:
         self.result: dict[str, Any] = {}
         self._candidates: dict[str, float] = {}      # tag -> prediction from a model trained for today's mode
         self.training_time: Optional[float] = None
+        self._committed_date = None                  # date today's start was committed (decision frozen)
+        self._actual_start: Optional[datetime] = None   # when the optimal-start OCCUPIED command fired
         self._scheduler_greenlets: list = []
         self.run_schedule_greenlet = None
         self._training_greenlet = None
@@ -342,12 +344,20 @@ class OptimalStartManager:
             self.data_handler.process_data()
 
     def reset_run(self) -> None:
-        """Cancel any pending ``run_method`` so the caller can start a fresh one."""
+        """
+        Restart today's optimal start: cancel any pending ``run_method`` and clear
+        today's committed decision so the next ``run_method`` evaluates again.
+        """
         self._cancel_greenlet("run_schedule_greenlet")
+        self._committed_date = None
 
     def run_method(self) -> None:
         """
         Evaluate the models and commit or reschedule today's start.
+
+        Once today's start is committed the decision is frozen: later calls the
+        same day (e.g. from the occupancy sync) return immediately, until
+        :meth:`reset_run` or the next day.
 
         Predicts with every model, decides the start time
         (:meth:`_aggregate_start_time`), and if the start is more than 15 minutes away
@@ -356,13 +366,18 @@ class OptimalStartManager:
         UNOCCUPIED transition at the end of occupancy. Does nothing on days without a
         timed schedule or on holidays.
         """
+        now = self.config.get_current_datetime()
+        if self._committed_date == now.date():
+            # Already decided today; the occupancy sync calls run_method whenever no
+            # run is pending, which must not re-decide (or overwrite training_time).
+            _log.debug("%s: optimal start already committed for today - skipping.", self.identity)
+            return
         self.result = {}
 
         current_schedule = self._timed_schedule_for_today()
         if current_schedule is None:
             return
 
-        now = self.config.get_current_datetime()
         occupancy_time = self._at(now, current_schedule.start)
         unoccupied_time = self._at(now, current_schedule.end)
 
@@ -380,6 +395,7 @@ class OptimalStartManager:
             return
 
         self.training_time = active_minutes
+        self._committed_date = now.date()
         _log.debug("%s: committing optimal start = %.1f min — %s",
                    self.identity, active_minutes, self.result)
         self._publish_start_times()
@@ -389,15 +405,14 @@ class OptimalStartManager:
         """
         Train today's models on this morning's data and persist what they learned.
 
-        The training window starts at the committed prestart (+5 min buffer). After a
+        The training window starts when the unit actually started this morning
+        (the recorded optimal-start OCCUPIED command; else the committed prestart)
+        plus a 5 min buffer. After a
         weekend/holiday the weekend copies are trained, except for models that keep
         one history (:attr:`~manager.optimal_start_models.OptimalStartZoneModel.SEPARATE_WEEKEND_MODEL`).
         """
-        training_time = (
-            int(self.training_time) + _TRAINING_TIME_BUFFER_MINUTES
-            if self.training_time is not None
-            else None
-        )
+        lead = self._start_lead_today()
+        training_time = int(lead) + _TRAINING_TIME_BUFFER_MINUTES if lead is not None else None
         data = self._get_current_data()
         if data.empty:
             _log.debug("%s: no data available — skipping training.", self.identity)
@@ -505,6 +520,34 @@ class OptimalStartManager:
         _log.debug("Scheduling train_models at %s.", format_timestamp(train_at))
         self._training_greenlet = self._cb.schedule_fn(train_at, self.train_models)
 
+    def _start_lead_today(self) -> Optional[float]:
+        """
+        Minutes before today's occupancy the unit actually started.
+
+        :return: From the recorded optimal-start OCCUPIED command if it fired today,
+            else the committed prestart if today's start was committed, else None.
+        :rtype: float | None
+        """
+        now = self.config.get_current_datetime()
+        schedule = self._timed_schedule_for_today()
+        if self._actual_start is not None and self._actual_start.date() == now.date() and schedule is not None:
+            occupancy = self._at(now, schedule.start)
+            return max(0.0, (occupancy - self._actual_start).total_seconds() / 60.0)
+        if self._committed_date == now.date():
+            return self.training_time
+        return None
+
+    def _start_occupancy(self, state) -> None:
+        """
+        Scheduled optimal-start transition: record when it fired, then command the unit.
+
+        :param state: Occupancy state to command (OCCUPIED).
+        :type state: OccupancyTypes
+        """
+        self._actual_start = self.config.get_current_datetime()
+        _log.debug("%s: optimal start fired at %s.", self.identity, format_timestamp(self._actual_start))
+        self._cb.change_occupancy_fn(state)
+
     def _schedule_occupancy_transitions(self, start_time, end_time) -> None:
         """
         Schedule the OCCUPIED and UNOCCUPIED commands (replacing pending ones).
@@ -517,7 +560,7 @@ class OptimalStartManager:
         self._cancel_greenlet("_start_greenlet")
         self._cancel_greenlet("_end_greenlet")
         self._start_greenlet = self._cb.schedule_fn(
-            start_time, self._cb.change_occupancy_fn, OccupancyTypes.OCCUPIED
+            start_time, self._start_occupancy, OccupancyTypes.OCCUPIED
         )
         self._end_greenlet = self._cb.schedule_fn(
             end_time, self._cb.change_occupancy_fn, OccupancyTypes.UNOCCUPIED

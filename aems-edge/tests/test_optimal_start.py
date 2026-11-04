@@ -30,7 +30,7 @@ then the heating/cooling stage turns off. Occupancy is 08:00.
 """
 import json
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 import numpy as np
 import pandas as pd
@@ -39,7 +39,8 @@ import pytest
 from manager import DefaultConfig, OptimalStartConfig, Schedule
 from manager.data_utils import Data, DataFileAccess
 from manager.optimal_start_manager import OptimalStartManager, PlatformCallbacks, resolve_model_names
-from manager.optimal_start_models import Carrier, Johnson, OperatingMode, RecoveryRegression, Sbs, Siemens
+from manager.optimal_start_models import (Carrier, Johnson, OperatingMode, RecoveryRegression, Sbs, Siemens,
+                                         ZoneConditions)
 from manager.points import DaysOfWeek, OccupancyTypes
 from manager.utils import calculate_prestart_time, ema, mask_stale, offset_time, trim
 
@@ -384,6 +385,48 @@ def test_recovery_regression_uses_outdoor_air_and_survives_missing_oat():
     assert np.isfinite(model.calculate_prestart(no_oat))     # falls back to the gap-only fit
 
 
+def test_recovery_regression_weights_recent_mornings(monkeypatch):
+    model = RecoveryRegression(OS_CFG, todays_schedule)
+    # the zone changed 8 mornings ago: 12 older mornings recovered slowly (0.04 F/min), the 8 newest quickly (0.1)
+    for i in range(20):
+        rate = 0.04 if i < 12 else 0.1
+        for gap in ((4.0,) if i % 2 else (6.0,)):
+            model.observations_heating.append(["", gap, 40.0, (gap - 0.5) / rate])
+    now = make_morning(start_temp=65).iloc[:61]                       # gap ~5 F
+    recent, slow = (5 - 0.5) / 0.1, (5 - 0.5) / 0.04                  # 45 vs 112.5 min
+    weighted = model.calculate_prestart(now)
+    monkeypatch.setattr(RecoveryRegression, "HALF_LIFE", 0)
+    equal = model.calculate_prestart(now)
+    assert abs(weighted - recent) < abs(equal - recent)               # follows the recent behaviour
+    assert weighted < (recent + slow) / 2 < equal                     # recent mornings decide; equal weights don't
+
+
+def test_recovery_regression_without_half_life_is_the_unweighted_fit(monkeypatch):
+    model = RecoveryRegression(OS_CFG, todays_schedule)
+    for morning in _rr_mornings([61, 62, 63, 64, 65, 66, 67]):
+        model.train(morning, 140)
+    monkeypatch.setattr(RecoveryRegression, "HALF_LIFE", 0)
+    now = make_morning(start_temp=65).iloc[:61]
+    cond = ZoneConditions.latest(now)
+    gap, oat_diff = cond.zone_error(OperatingMode.HEATING), cond.outdoor_error(OperatingMode.HEATING)
+    obs = np.array([[o[1], o[2], o[3]] for o in model.observations_heating], dtype=float)
+    design = np.column_stack([np.ones(len(obs)), obs[:, 0], obs[:, 0] * obs[:, 1]])
+    coef, res = RecoveryRegression._huber_fit(design, obs[:, 2])
+    expected = np.array([1.0, gap, gap * oat_diff]) @ coef + np.quantile(res, RecoveryRegression.MARGIN_QUANTILE)
+    assert model.calculate_prestart(now) == pytest.approx(np.clip(expected, OS_CFG.latest_start_time,
+                                                                  OS_CFG.earliest_start_time))
+
+
+def test_weighted_quantile():
+    from manager.optimal_start_models import _weighted_quantile
+    values = np.array([5.0, -3.0, 10.0, 0.0, 2.0, 7.0])
+    for q in (0.1, 0.5, 0.7, 0.9):
+        assert _weighted_quantile(values, np.ones(6), q) == pytest.approx(np.quantile(values, q, method="hazen"))
+    # nearly all the weight on one value -> the median lands on it
+    w = np.array([1e-6, 1e-6, 1.0, 1e-6, 1e-6, 1e-6])
+    assert _weighted_quantile(values, w, 0.5) == pytest.approx(10.0, abs=1e-3)
+
+
 def test_recovery_regression_caps_unfinished_recovery_at_horizon():
     morning = make_morning(start_temp=50)                   # 20 F gap: not within 0.5 F by occupancy + 90 (09:30)
     model = RecoveryRegression(OS_CFG, todays_schedule)
@@ -698,6 +741,69 @@ def test_run_method_reschedules_when_too_early(tmp_path, platform):
 
     assert len(platform.pending("run_method")) == 1
     assert not [e for e in platform.events if e.args == (OccupancyTypes.OCCUPIED,)]
+
+
+def _clock(manager, when):
+    manager.config.get_current_datetime = lambda: when
+
+
+def test_committed_start_is_not_re_decided_by_the_occupancy_sync(tmp_path, platform):
+    """Regression: after a commit the sync calls run_method every minute; the decision must stay frozen."""
+    manager = make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 5, 0), df=None)   # untrained -> 180 min
+    manager.run_method()                                                                     # commits at 05:00
+    occupied = [e for e in platform.events if e.args == (OccupancyTypes.OCCUPIED,)]
+    assert len(occupied) == 1 and manager.training_time == 180
+    publishes = len(platform.published)
+    for minute in range(1, 180):                                                             # sync until 08:00
+        _clock(manager, datetime(2026, 11, 3, 5, 0) + timedelta(minutes=minute))
+        manager.run_method()
+    assert len([e for e in platform.events if e.args == (OccupancyTypes.OCCUPIED,)]) == 1
+    assert len(platform.published) == publishes                                              # no re-publishing
+    assert manager.training_time == 180                                                      # not overwritten
+
+
+def test_training_window_starts_at_the_actual_start(tmp_path, platform, monkeypatch):
+    manager = make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 5, 0), df=None)
+    manager.run_method()                                                                     # commit (lead 180)
+    manager.data_handler.df = make_morning()
+    start_event = next(e for e in platform.events if e.args == (OccupancyTypes.OCCUPIED,))
+    _clock(manager, datetime(2026, 11, 3, 6, 0))                                             # transition fires at 06:00
+    start_event.fn(*start_event.args)
+    assert platform.occupancy[-1] == OccupancyTypes.OCCUPIED
+    seen = []
+    monkeypatch.setattr(manager, "_train_single_model", lambda tag, model, data, prestart: seen.append(prestart))
+    _clock(manager, datetime(2026, 11, 3, 9, 35))
+    manager.train_models()
+    assert set(seen) == {120 + 5}                       # 08:00 - 06:00 = 120 min actual lead (+5 buffer), not 180
+
+
+def test_training_falls_back_to_committed_lead_without_recorded_start(tmp_path, platform, monkeypatch):
+    manager = make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 5, 0), df=None)
+    manager.run_method()
+    manager.data_handler.df = make_morning()
+    seen = []
+    monkeypatch.setattr(manager, "_train_single_model", lambda tag, model, data, prestart: seen.append(prestart))
+    _clock(manager, datetime(2026, 11, 3, 9, 35))
+    manager.train_models()
+    assert set(seen) == {180 + 5}
+
+
+def test_reset_run_allows_a_fresh_decision(tmp_path, platform):
+    manager = make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 5, 0), df=None)
+    manager.run_method()
+    manager.reset_run()
+    _clock(manager, datetime(2026, 11, 3, 5, 10))
+    manager.run_method()
+    assert len([e for e in platform.events if e.args == (OccupancyTypes.OCCUPIED,)]) == 2
+
+
+def test_yesterdays_commitment_does_not_block_today(tmp_path, platform):
+    manager = make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 5, 0), df=None)
+    manager.run_method()
+    _clock(manager, datetime(2026, 11, 4, 5, 0))                                             # next day (Wednesday)
+    manager.config.schedule["Wednesday"] = {"start": "08:00", "end": "17:00"}
+    manager.run_method()
+    assert len([e for e in platform.events if e.args == (OccupancyTypes.OCCUPIED,)]) == 2
 
 
 def test_reset_run_cancels_pending_run(tmp_path, platform):
