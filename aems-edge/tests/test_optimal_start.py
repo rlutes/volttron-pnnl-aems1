@@ -52,8 +52,8 @@ def utc_tz(monkeypatch):
     monkeypatch.setenv("LOCAL_TZ", "UTC")
 
 
-def make_morning(mode="heating", start_temp=62.0, sp=70.0, oat=30.0) -> pd.DataFrame:
-    idx = pd.date_range("2026-11-03 05:00", "2026-11-03 09:30", freq="1min", tz="UTC")
+def make_morning(mode="heating", start_temp=62.0, sp=70.0, oat=30.0, end="2026-11-03 09:30") -> pd.DataFrame:
+    idx = pd.date_range("2026-11-03 05:00", end, freq="1min", tz="UTC")
     fan_on = idx >= pd.Timestamp("2026-11-03 06:00", tz="UTC")
     minutes_on = np.cumsum(fan_on)
     if mode == "heating":
@@ -427,11 +427,30 @@ def test_weighted_quantile():
     assert _weighted_quantile(values, w, 0.5) == pytest.approx(10.0, abs=1e-3)
 
 
+@pytest.mark.parametrize("earliest, latest, horizon", [(60, 0, 90), (90, 0, 90), (90, 10, 90), (120, 10, 110),
+                                                      (180, 10, 170), (240, 0, 240)])
+def test_observation_horizon_covers_the_full_start_allowance(earliest, latest, horizon):
+    assert RecoveryRegression.observation_horizon(earliest, latest) == horizon
+    cfg = OptimalStartConfig(latest_start_time=latest, earliest_start_time=earliest, allowable_setpoint_deviation=1)
+    assert RecoveryRegression(cfg, todays_schedule).horizon_minutes == horizon
+
+
 def test_recovery_regression_caps_unfinished_recovery_at_horizon():
+    cfg = OptimalStartConfig(latest_start_time=0, earliest_start_time=90, allowable_setpoint_deviation=1)
     morning = make_morning(start_temp=50)                   # 20 F gap: not within 0.5 F by occupancy + 90 (09:30)
-    model = RecoveryRegression(OS_CFG, todays_schedule)
+    model = RecoveryRegression(cfg, todays_schedule)
     model.train(morning, 140)
     assert model.observations_heating[0][3] == pytest.approx(210)   # 06:00 -> 09:30
+
+
+def test_recovery_regression_observes_long_recoveries_to_the_extended_horizon():
+    # earliest 180 / latest 10 -> horizon 170 min: watched to 10:50, not 09:30
+    model = RecoveryRegression(OS_CFG, todays_schedule)
+    model.train(make_morning(start_temp=40, end="2026-11-03 11:00"), 140)    # 30 F gap: needs ~369 min
+    assert model.observations_heating[0][3] == pytest.approx(290)   # 06:00 -> 10:50, still not within 0.5 F
+    finished = RecoveryRegression(OS_CFG, todays_schedule)
+    finished.train(make_morning(start_temp=50, end="2026-11-03 11:00"), 140)   # 20 F gap: 19.5 / 0.08 = 244 min
+    assert finished.observations_heating[0][3] == pytest.approx(244, abs=2)   # past the old 09:30 cut, recorded exactly
 
 
 def test_recovery_regression_ignores_mornings_without_recovery_or_complete_data():
@@ -713,12 +732,20 @@ def test_set_up_run_schedules_run_and_training(tmp_path, platform):
     runs = platform.pending("run_method")
     assert [e.when for e in runs] == [datetime(2026, 11, 3, 5, 0)]
     trainings = platform.pending("train_models")
-    assert [e.when for e in trainings] == [datetime(2026, 11, 3, 9, 35)]   # occupancy + 95 min
+    # default limits 180 / 10 min: horizon 180 - 10 = 170 -> train at occupancy + 175 min
+    assert [e.when for e in trainings] == [datetime(2026, 11, 3, 10, 55)]
 
 
 def test_training_not_scheduled_after_window(tmp_path, platform):
-    make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 10, 0))
+    make_manager(tmp_path, platform, now=datetime(2026, 11, 3, 11, 0))
     assert not platform.pending("train_models")
+
+
+@pytest.mark.parametrize("earliest, latest, delay", [(60, 0, 95), (90, 0, 95), (120, 10, 115), (180, 10, 175)])
+def test_training_waits_for_the_observation_horizon(tmp_path, platform, earliest, latest, delay):
+    manager = make_manager(tmp_path, platform)
+    manager.earliest_start_time, manager.latest_start_time = earliest, latest
+    assert manager._training_delay_minutes() == delay
 
 
 def test_run_method_without_data_commits_earliest_start(tmp_path, platform):

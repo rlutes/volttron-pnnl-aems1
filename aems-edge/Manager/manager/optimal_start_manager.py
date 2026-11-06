@@ -73,7 +73,8 @@ from volttron.platform.scheduling import cron
 from . import DefaultConfig, OptimalStartConfig
 from .data_utils import Data
 from .holiday_manager import HolidayManager
-from .optimal_start_models import Carrier, Johnson, OptimalStartZoneModel, RecoveryRegression, Sbs, Siemens
+from .optimal_start_models import (_TRAINING_END_OFFSET_MINUTES, Carrier, Johnson, OptimalStartZoneModel,
+                                    RecoveryRegression, Sbs, Siemens)
 from .points import OccupancyTypes
 from .utils import mask_stale
 
@@ -125,8 +126,10 @@ _CRON_DAILY_SETUP = "1 0 * * *"  # 00:01 — determine today's schedule
 _RESCHEDULE_INTERVAL_MINUTES = 15
 _TRAINING_TIME_BUFFER_MINUTES = 5
 # Train once every model's window has closed: the coefficient models use up to
-# occupancy + 60 min, RecoveryRegression observes up to occupancy + 90 min.
-_TRAINING_DELAY_MINUTES = RecoveryRegression.OBSERVATION_HORIZON_MINUTES + 5
+# occupancy + 60 min, RecoveryRegression observes up to occupancy + its horizon
+# (>= 90 min, see RecoveryRegression.observation_horizon); train this many
+# minutes after the later of the two.
+_TRAINING_DELAY_BUFFER_MINUTES = 5
 _WEEKEND_TRAINING_WINDOW = 4
 
 # Stale-data guard: a reading unchanged for longer than this (minutes) is treated
@@ -505,7 +508,7 @@ class OptimalStartManager:
 
     def _schedule_todays_training(self) -> None:
         """
-        Schedule :meth:`train_models` at occupancy + ``_TRAINING_DELAY_MINUTES``,
+        Schedule :meth:`train_models` at occupancy + :meth:`_training_delay_minutes`,
         if that time is still ahead today (replaces any pending training).
         """
         self._cancel_greenlet("_training_greenlet")
@@ -514,11 +517,23 @@ class OptimalStartManager:
             return
 
         now = self.config.get_current_datetime()
-        train_at = self._at(now, current_schedule.start) + td(minutes=_TRAINING_DELAY_MINUTES)
+        train_at = self._at(now, current_schedule.start) + td(minutes=self._training_delay_minutes())
         if train_at <= now:
             return
         _log.debug("Scheduling train_models at %s.", format_timestamp(train_at))
         self._training_greenlet = self._cb.schedule_fn(train_at, self.train_models)
+
+    def _training_delay_minutes(self) -> float:
+        """
+        Minutes after occupancy at which every model's training window has closed.
+
+        :return: The later of the coefficient models' window end and the
+            RecoveryRegression observation horizon, plus
+            ``_TRAINING_DELAY_BUFFER_MINUTES``.
+        :rtype: float
+        """
+        horizon = RecoveryRegression.observation_horizon(self.earliest_start_time, self.latest_start_time)
+        return max(_TRAINING_END_OFFSET_MINUTES, horizon) + _TRAINING_DELAY_BUFFER_MINUTES
 
     def _start_lead_today(self) -> Optional[float]:
         """

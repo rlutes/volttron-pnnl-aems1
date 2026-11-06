@@ -1253,8 +1253,9 @@ class RecoveryRegression(OptimalStartZoneModel):
     prediction, so the observation history is the complete state.
 
     The model keeps one history for every day (``SEPARATE_WEEKEND_MODEL`` is
-    False). Training must run at least ``OBSERVATION_HORIZON_MINUTES`` after
-    occupancy; a recovery not finished by then is recorded at the horizon.
+    False). Each recovery is observed until occupancy + :meth:`observation_horizon`
+    minutes, so training must run after that; a recovery not finished by then is
+    recorded at the horizon.
 
     :cvar TARGET_DEVIATION: Target closeness to setpoint (°F) that ends a recovery.
     :cvar HISTORY: Observations kept per mode.
@@ -1262,8 +1263,8 @@ class RecoveryRegression(OptimalStartZoneModel):
     :cvar MARGIN_QUANTILE: Residual quantile added as the early-start margin.
     :cvar HALF_LIFE: Observations back at which an observation's weight halves
         (recency weighting of the fit and margin); 0 weights all equally.
-    :cvar OBSERVATION_HORIZON_MINUTES: Minutes after occupancy a recovery is
-        observed.
+    :cvar OBSERVATION_HORIZON_MINUTES: Minimum minutes after occupancy a recovery
+        is observed (see :meth:`observation_horizon`).
     :ivar observations_cooling: Cooling observations,
         ``[timestamp, gap, oat_diff or None, minutes]``, oldest first.
     :vartype observations_cooling: list
@@ -1295,6 +1296,37 @@ class RecoveryRegression(OptimalStartZoneModel):
         # Each observation: [timestamp, gap (F), oat_diff (F) or None, minutes]
         self.observations_cooling: list = []
         self.observations_heating: list = []
+
+    @classmethod
+    def observation_horizon(cls, earliest_start_time: float, latest_start_time: float) -> float:
+        """
+        Minutes after occupancy a recovery is observed.
+
+        At least ``OBSERVATION_HORIZON_MINUTES``, and long enough that a recovery
+        started as late as ``latest_start_time`` is still watched for the full
+        ``earliest_start_time``: the start lead is capped at
+        ``earliest_start_time``, so the model must be able to see recoveries that
+        need all of it (``lead + horizon >= earliest_start_time`` for every
+        lead >= ``latest_start_time``). Otherwise mornings the model started too
+        late would be recorded short and it could never learn to use the full
+        allowance.
+
+        :param earliest_start_time: Maximum prestart (minutes).
+        :type earliest_start_time: float
+        :param latest_start_time: Minimum prestart (minutes).
+        :type latest_start_time: float
+        :return: Horizon in minutes after occupancy.
+        :rtype: float
+        """
+        return float(max(cls.OBSERVATION_HORIZON_MINUTES, earliest_start_time - latest_start_time))
+
+    @property
+    def horizon_minutes(self) -> float:
+        """
+        :return: This model's observation horizon for its current configuration.
+        :rtype: float
+        """
+        return self.observation_horizon(self.earliest_start_time, self.latest_start_time)
 
     def _history(self, mode: OperatingMode) -> list:
         """
@@ -1331,7 +1363,7 @@ class RecoveryRegression(OptimalStartZoneModel):
         Record this morning's recovery as an observation.
 
         Uses the window from ``prestart`` minutes before occupancy to occupancy +
-        ``OBSERVATION_HORIZON_MINUTES`` (see :meth:`_observe`) and appends the
+        :attr:`horizon_minutes` (see :meth:`_observe`) and appends the
         observation to the history for its mode, keeping the last ``HISTORY``.
         :attr:`record` holds the observation, or stays empty if none was recorded.
 
@@ -1350,7 +1382,7 @@ class RecoveryRegression(OptimalStartZoneModel):
         if schedule is None or schedule.start is None:
             return
 
-        window = self._training_window(data, schedule, prestart, end_offset=self.OBSERVATION_HORIZON_MINUTES)
+        window = self._training_window(data, schedule, prestart, end_offset=int(np.ceil(self.horizon_minutes)))
         observation = self._observe(window, schedule)
         if observation is None:
             return
@@ -1400,7 +1432,7 @@ class RecoveryRegression(OptimalStartZoneModel):
             return None                                   # no recovery needed this morning
 
         occupancy = start.replace(hour=schedule.start.hour, minute=schedule.start.minute, second=0, microsecond=0)
-        horizon = occupancy + pd.Timedelta(minutes=self.OBSERVATION_HORIZON_MINUTES)
+        horizon = occupancy + pd.Timedelta(minutes=self.horizon_minutes)
         after = window[window.index >= start]
         if mode is OperatingMode.COOLING:
             hit = after[after["zonetemperature"] <= after["coolingsetpoint"] + self.TARGET_DEVIATION]
