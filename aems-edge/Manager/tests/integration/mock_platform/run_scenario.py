@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-REPO_MANAGER = HERE.parents[2] / "Manager"            # aems-edge/Manager
+REPO_MANAGER = HERE.parents[2]                       # aems-edge/Manager (this file: Manager/tests/integration/mock_platform)
 VOLTTRON_BIN = Path(os.environ.get("VOLTTRON_ENV", "/home/volttron/volttron/env")) / "bin"
 sys.path.insert(0, str(HERE / "mock_driver"))
 from mock_driver import thermal  # noqa: E402
