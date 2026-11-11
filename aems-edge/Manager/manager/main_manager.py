@@ -77,6 +77,43 @@ if 'PYDEVD_USE_FRAME_EVAL' in os.environ:
 
 StrPath = Union[str, Path]
 
+# Config-store entry holding the zone setpoints. The manager stores it (RPC), the
+# periodic setpoint validator re-applies it and the after-hours manager restores
+# from it, so a change to this entry must be applied - and kept - as soon as it is
+# stored.
+SET_POINTS_ENTRY = 'set_points'
+# Older name for the same entry (used in some configuration files). Storing it
+# applies the setpoints and copies them into SET_POINTS_ENTRY; otherwise the
+# validator would re-apply the old SET_POINTS_ENTRY within setpoint_validate_frequency.
+LEGACY_SET_POINTS_ENTRY = 'temperature_setpoints'
+
+
+def config_store_handlers(proxy) -> dict:
+    """
+    Config-store entry name -> handler ``handler(contents, update_store=False)``.
+
+    The order is the order the entries should be applied in.
+
+    :param proxy: The :class:`ManagerProxy` the handlers act on.
+    :return: Ordered mapping of entry name to handler.
+    :rtype: dict
+    """
+    def legacy_set_points(contents, update_store: bool = False) -> None:
+        # Apply and persist under SET_POINTS_ENTRY. The store cannot be written
+        # from inside a configuration callback, so run it in its own greenlet.
+        gevent.spawn(proxy.set_temperature_setpoints, contents, update_store=True)
+
+    return {
+        'schedule': proxy.set_schedule,
+        SET_POINTS_ENTRY: proxy.set_temperature_setpoints,
+        LEGACY_SET_POINTS_ENTRY: legacy_set_points,
+        'holidays': proxy.set_holidays,
+        'optimal_start': proxy.set_optimal_start,
+        'occupancy_overrides': proxy.set_occupancy_override,
+        'location': proxy.set_location,
+        'control': proxy.set_configurations,
+    }
+
 
 class ManagerAgent(Agent):
 
@@ -91,15 +128,7 @@ class ManagerAgent(Agent):
         # updated from the configuration store.
         #
         # TODO: Verify that the order is respected when the agent starts up.
-        self._config_references = {
-            'schedule': self._proxy.set_schedule,
-            'temperature_setpoints': self._proxy.set_temperature_setpoints,
-            'holidays': self._proxy.set_holidays,
-            'optimal_start': self._proxy.set_optimal_start,
-            'occupancy_overrides': self._proxy.set_occupancy_override,
-            'location': self._proxy.set_location,
-            'control': self._proxy.set_configurations
-        }
+        self._config_references = config_store_handlers(self._proxy)
 
         # Registers the configstore for the pattern 'config' ('config is default config entry')
         self.vip.config.subscribe(self.update_default, actions=['NEW', 'UPDATE'], pattern='config')
@@ -111,8 +140,8 @@ class ManagerAgent(Agent):
     def update_from_config_store(self, config_name: str, action: str, contents: dict):
         """
         Updates the configuration for each of the manager functions:
-            schedule, temperature_setpoints, holidays, optimal_start,
-            occupancy_overrides, location
+            schedule, set_points (or the legacy temperature_setpoints), holidays,
+            optimal_start, occupancy_overrides, location, control
 
         :param config_name: The name of the configuration being updated.
         :type config_name: str
@@ -315,7 +344,7 @@ class ManagerProxy:
         except KeyError:
             after_hours_schedule = {}
         try:
-            default_setpoints = self.config_get('set_points')
+            default_setpoints = self.config_get(SET_POINTS_ENTRY)
         except KeyError:
             default_setpoints = self.cfg.default_setpoints
 
@@ -435,13 +464,13 @@ class ManagerProxy:
 
     def _set_default_setpoint(self, config: DefaultConfig):
         try:
-            temp_set_points = self.config_get('set_points')
+            temp_set_points = self.config_get(SET_POINTS_ENTRY)
         except KeyError:
             _log.info("No set_points in config store using defaults.")
-            self.config_set('set_points', self.cfg.default_setpoints)
+            self.config_set(SET_POINTS_ENTRY, self.cfg.default_setpoints)
         self._validate_setpoints_greenlet = self.core.periodic(
             config.setpoint_validate_frequency,
-            lambda: self.set_temperature_setpoints(self.config_get('set_points'), update_store=False))
+            lambda: self.set_temperature_setpoints(self.config_get(SET_POINTS_ENTRY), update_store=False))
 
     def update_default_config(self, config: DefaultConfig):
         """
@@ -626,9 +655,10 @@ class ManagerProxy:
 
         _log.debug(f"Update temperature_setpoints - {data} -- update_store: {update_store}")
 
+        after_hours = self.after_hours_manager      # None until setup_runtime has run
         result = (
-            self.after_hours_manager.service_setpoints
-            if self.after_hours_manager.is_active
+            after_hours.service_setpoints
+            if after_hours is not None and after_hours.is_active
             else self.create_setpoints(data)
         )
 
@@ -637,7 +667,7 @@ class ManagerProxy:
             return False
 
         if update_store:
-            self.config_set("set_points", data)
+            self.config_set(SET_POINTS_ENTRY, data)
 
         control_passes = (
             ({"on_property": "relinquishDefault"}, {})
