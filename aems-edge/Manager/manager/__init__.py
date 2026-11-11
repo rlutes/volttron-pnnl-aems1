@@ -194,6 +194,9 @@ class DefaultConfig:
         self.validate()
 
     def _initialize_directories(self):
+        # Directories from a JSON config arrive as strings; ~ is allowed.
+        self.data_dir = Path(self.data_dir).expanduser()
+        self.model_dir = Path(self.model_dir).expanduser()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
 

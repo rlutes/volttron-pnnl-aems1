@@ -24,7 +24,9 @@
 from manager.main_manager import ManagerProxy
 
 
-def test_manager_proxy(manager_proxy: ManagerProxy):
-
-    assert manager_proxy is not None
+def test_manager_proxy(manager_proxy: ManagerProxy, tmp_path):
     assert isinstance(manager_proxy, ManagerProxy)
+    # Built from the shipped example config, with data kept under tmp_path (not ~/.manager).
+    assert manager_proxy.cfg.data_dir == tmp_path / "data" and manager_proxy.cfg.data_dir.is_dir()
+    assert manager_proxy.datafile.datafile == tmp_path / "data" / "SCHNEIDER.csv"
+    assert manager_proxy.optimal_start.selected_models == ["rr"]
